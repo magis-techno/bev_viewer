@@ -4,15 +4,21 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+import importlib.util
+import sys
 
 import numpy as np
 from PIL import Image, ImageDraw
 
-import bev_debug_viewer as bev
-
 ROOT = Path(__file__).resolve().parent
+VIEWER_PATH = ROOT / 'bev_debug_viewer.py'
+spec = importlib.util.spec_from_file_location('bev_debug_viewer', VIEWER_PATH)
+bev = importlib.util.module_from_spec(spec)
+sys.modules['bev_debug_viewer'] = bev
+spec.loader.exec_module(bev)
+
 W, H = 1280, 720
-FX = FY = 720.0
+FX = FY = 760.0
 CX, CY = W / 2.0, H / 2.0
 K = np.array([[FX, 0, CX], [0, FY, CY], [0, 0, 1]], dtype=np.float64)
 
@@ -20,7 +26,7 @@ K = np.array([[FX, 0, CX], [0, FY, CY], [0, 0, 1]], dtype=np.float64)
 def unit(v):
     v = np.asarray(v, dtype=np.float64)
     n = np.linalg.norm(v)
-    return v if n < 1e-9 else v / n
+    return v if n < 1e-12 else v / n
 
 
 def make_cam_rot_from_target(cam_pos, target, world_up=np.array([0.0, 0.0, 1.0])):
@@ -34,23 +40,23 @@ def make_cam_rot_from_target(cam_pos, target, world_up=np.array([0.0, 0.0, 1.0])
 def camera_record(name, pos, yaw_deg, pitch_down_deg=8.0):
     yaw = math.radians(yaw_deg)
     forward_xy = np.array([math.cos(yaw), math.sin(yaw), 0.0])
-    target = np.asarray(pos, dtype=np.float64) + forward_xy * 20.0 + np.array([0.0, 0.0, -20.0 * math.tan(math.radians(pitch_down_deg))])
+    target = np.asarray(pos, dtype=np.float64) + forward_xy * 24.0 + np.array([0.0, 0.0, -24.0 * math.tan(math.radians(pitch_down_deg))])
     R = make_cam_rot_from_target(np.asarray(pos, dtype=np.float64), target)
     return {
-        "name": name,
-        "image_path": f"./{name}.png",
-        "intrinsic": K.tolist(),
-        "extrinsic_to_ego": {"translation": list(map(float, pos)), "rotation_matrix": R.tolist()},
+        'name': name,
+        'image_path': f'./{name}.png',
+        'intrinsic': K.tolist(),
+        'extrinsic_to_ego': {'translation': list(map(float, pos)), 'rotation_matrix': R.tolist()},
     }
 
 
-def generate_box_points(center, size_lwh, yaw, n_per_face=240, seed=0):
+def generate_box_points(center, size_lwh, yaw, n_per_face=420, seed=0):
     rng = np.random.default_rng(seed)
     l, w, h = size_lwh
     local = []
-    per_face = max(8, n_per_face // 6)
+    face_count = max(24, n_per_face // 6)
     for axis, val in [(0, l / 2), (0, -l / 2), (1, w / 2), (1, -w / 2), (2, h / 2), (2, -h / 2)]:
-        pts = rng.uniform(-1.0, 1.0, size=(per_face, 3))
+        pts = rng.uniform(-1.0, 1.0, size=(face_count, 3))
         pts[:, 0] *= l / 2
         pts[:, 1] *= w / 2
         pts[:, 2] *= h / 2
@@ -61,170 +67,157 @@ def generate_box_points(center, size_lwh, yaw, n_per_face=240, seed=0):
     return (R @ local.T).T + np.asarray(center)[None, :]
 
 
-def generate_lane_points(y_values, x_min=-28.0, x_max=45.0, z=0.0, samples=260):
+def lane_centerline(xs):
+    ys = 0.6 * np.sin((xs - 6.0) / 14.0) + 0.012 * (xs - 10.0)
+    return ys
+
+
+def lane_poly(offset, x_min=-35.0, x_max=42.0, samples=180):
     xs = np.linspace(x_min, x_max, samples)
-    pts = []
-    for y in y_values:
-        jitter = 0.03 * np.sin(xs * 0.3 + y)
-        lane = np.stack([xs, np.full_like(xs, y), np.full_like(xs, z) + jitter], axis=1)
-        pts.append(lane)
-    return np.concatenate(pts, axis=0)
+    ys = lane_centerline(xs) + offset
+    zs = np.zeros_like(xs)
+    return np.stack([xs, ys, zs], axis=1)
 
 
-def dense_polyline(poly, step=0.4):
-    poly = np.asarray(poly, dtype=np.float64)
-    segs = []
-    for a, b in zip(poly[:-1], poly[1:]):
-        d = np.linalg.norm(b - a)
-        n = max(2, int(math.ceil(d / step)))
-        t = np.linspace(0.0, 1.0, n, endpoint=False)
-        segs.append(a[None, :] * (1 - t[:, None]) + b[None, :] * t[:, None])
-    segs.append(poly[-1:])
-    return np.concatenate(segs, axis=0)
+def lane_lidar_samples(poly, jitter=0.05, seed=0):
+    rng = np.random.default_rng(seed)
+    pts = bev.dense_polyline(poly, step=0.35)
+    pts = pts.copy()
+    pts[:, 0] += rng.normal(scale=jitter, size=len(pts))
+    pts[:, 1] += rng.normal(scale=jitter, size=len(pts))
+    pts[:, 2] += rng.normal(scale=jitter * 0.2, size=len(pts))
+    return pts
 
 
-def chunk_visible_polyline(cam, pts_ego):
-    pts_cam = bev.ego_to_cam(cam, pts_ego)
-    _, valid = bev.project_points_to_image(pts_cam, cam.intrinsic, (W, H), min_depth=0.2)
+def history_poses_world():
+    poses = []
+    xs = np.array([-16.0, -12.0, -8.5, -5.0, -2.0])
+    ys = lane_centerline(xs)
+    yaws = np.arctan2(np.gradient(ys), np.gradient(xs))
+    for x, y, yaw in zip(xs, ys, yaws):
+        T = bev.make_hmat(bev.yaw_to_rotmat(float(yaw)), np.array([x, y, 0.0], dtype=np.float64))
+        poses.append(T)
+    return poses
+
+
+def history_trajectory_ego():
+    xs = np.linspace(-16.0, 0.0, 13)
+    ys = lane_centerline(xs)
+    zs = np.zeros_like(xs)
+    return np.stack([xs, ys, zs], axis=1)
+
+
+def chunk_visible_polyline(scene, cam, pts_ego):
+    pts_cam = scene.ego_to_cam(cam, pts_ego)
+    uv, valid = bev.project_points_to_image(pts_cam, cam.intrinsic, (W, H), min_depth=0.2)
     if not np.any(valid):
         return []
-    valid_idx = np.where(valid)[0]
+    uv_full = np.full((len(pts_ego), 2), np.nan)
+    uv_full[np.where(valid)[0]] = uv
     chunks = []
-    start = 0
-    while start < len(valid_idx):
-        end = start + 1
-        while end < len(valid_idx) and valid_idx[end] == valid_idx[end - 1] + 1:
-            end += 1
-        idxs = valid_idx[start:end]
-        pts_cam_seg = pts_cam[idxs]
-        uvw = (cam.intrinsic @ pts_cam_seg.T).T
-        uv_seg = uvw[:, :2] / uvw[:, 2:3]
-        if len(uv_seg) >= 2:
-            chunks.append([tuple(map(float, p)) for p in uv_seg])
-        start = end
+    start = None
+    for i, ok in enumerate(np.isfinite(uv_full[:, 0])):
+        if ok and start is None:
+            start = i
+        if (not ok or i == len(uv_full) - 1) and start is not None:
+            end = i if not ok else i + 1
+            if end - start >= 2:
+                chunks.append([tuple(map(float, p)) for p in uv_full[start:end]])
+            start = None
     return chunks
 
 
-def render_camera_image(scene, cam, boxes, map_polys, out_path):
-    img = Image.new("RGB", (W, H), (210, 230, 245))
-    draw = ImageDraw.Draw(img, "RGBA")
-    draw.rectangle([0, H * 0.45, W, H], fill=(60, 65, 72, 255))
-    draw.line([(0, H * 0.45), (W, H * 0.45)], fill=(180, 190, 205, 255), width=2)
+def render_camera_image(scene, cam, out_path):
+    img = Image.new('RGB', (W, H), (196, 220, 243))
+    draw = ImageDraw.Draw(img, 'RGBA')
+    draw.rectangle([0, int(H * 0.46), W, H], fill=(56, 62, 70, 255))
+    draw.line([(0, int(H * 0.46)), (W, int(H * 0.46))], fill=(220, 228, 235, 180), width=2)
 
-    lane_colors = [(255, 220, 80, 220), (255, 255, 255, 220)]
-    for i, poly in enumerate(map_polys):
-        pts_dense = dense_polyline(poly, step=0.25)
-        for chunk in chunk_visible_polyline(cam, pts_dense):
+    lane_colors = [(255, 232, 120, 255), (255, 255, 255, 250), (255, 232, 120, 255)]
+    for idx, poly in enumerate(bev.polylines_ego(scene)):
+        dense = bev.dense_polyline(poly, step=0.25)
+        for chunk in chunk_visible_polyline(scene, cam, dense):
             if len(chunk) >= 2:
-                draw.line(chunk, fill=lane_colors[i % len(lane_colors)], width=5)
+                draw.line(chunk, fill=lane_colors[idx % len(lane_colors)], width=6)
 
-    for box in boxes:
-        corners = bev.transform_box(bev.make_box_corners(box["size_lwh"]), np.asarray(box["center_ego"]), box["yaw_rad"])
-        pts_cam = bev.ego_to_cam(cam, corners)
-        _, valid = bev.project_points_to_image(pts_cam, cam.intrinsic, (W, H), min_depth=0.2)
-        if valid.sum() < 6:
+    for box in scene.boxes:
+        corners = bev.transform_box(bev.make_box_corners(box.size_lwh), box.center_ego, box.yaw_rad)
+        pts_cam = scene.ego_to_cam(cam, corners)
+        uv, mask = bev.project_points_to_image(pts_cam, cam.intrinsic, (W, H), min_depth=0.2)
+        if mask.sum() < 8:
             continue
-        uv_all = np.full((8, 2), np.nan)
-        valid_idx = np.where(valid)[0]
-        uv = (cam.intrinsic @ pts_cam[valid].T).T
-        uv = uv[:, :2] / uv[:, 2:3]
-        uv_all[valid_idx] = uv
-        faces = [[0, 1, 2, 3], [0, 1, 5, 4], [1, 2, 6, 5], [0, 3, 7, 4], [3, 2, 6, 7]]
+        uv_full = (cam.intrinsic @ pts_cam.T).T
+        uv_full = uv_full[:, :2] / uv_full[:, 2:3]
+        faces = [[0,1,2,3], [0,1,5,4], [1,2,6,5], [0,3,7,4], [3,2,6,7]]
         for face in faces:
-            if np.all(np.isfinite(uv_all[face])):
-                draw.polygon([tuple(uv_all[i]) for i in face], fill=(220, 60, 60, 45))
+            draw.polygon([tuple(uv_full[i]) for i in face], fill=(255, 120, 50, 40))
         for i0, i1 in bev.CAMERA_BOX_EDGES:
-            if np.all(np.isfinite(uv_all[[i0, i1]])):
-                draw.line([tuple(uv_all[i0]), tuple(uv_all[i1])], fill=(170, 20, 20, 255), width=3)
+            draw.line([tuple(uv_full[i0]), tuple(uv_full[i1])], fill=(175, 48, 16, 255), width=3)
 
+    banner = [18, 18, 240, 56]
+    draw.rounded_rectangle(banner, radius=10, fill=(15, 23, 42, 160))
+    draw.text((30, 29), cam.name, fill=(255, 255, 255, 255))
     img.save(out_path)
 
 
-def main():
-    camera_defs = [
-        camera_record("cam_front_left", [1.9, 0.35, 1.45], 28),
-        camera_record("cam_front_right", [1.9, -0.35, 1.45], -28),
-        camera_record("cam_left_front", [0.7, 0.95, 1.45], 92),
-        camera_record("cam_left_rear", [-0.9, 0.95, 1.45], 145),
-        camera_record("cam_right_front", [0.7, -0.95, 1.45], -92),
-        camera_record("cam_right_rear", [-0.9, -0.95, 1.45], -145),
-        camera_record("cam_rear", [-1.9, 0.00, 1.45], 180),
-    ]
+camera_defs = [
+    camera_record('cam_front_left',  [1.9,  0.35, 1.45],  28),
+    camera_record('cam_front_right', [1.9, -0.35, 1.45], -28),
+    camera_record('cam_left_front',  [0.7,  0.95, 1.45],  96),
+    camera_record('cam_left_rear',   [-0.9, 0.95, 1.45],  150),
+    camera_record('cam_right_front', [0.7, -0.95, 1.45], -96),
+    camera_record('cam_right_rear',  [-0.9,-0.95, 1.45], -150),
+    camera_record('cam_rear',        [-1.9, 0.00, 1.45], 180),
+]
 
-    boxes = [
-        {"label": "car_gt", "center_ego": [18.0, 0.4, 0.85], "size_lwh": [4.6, 1.9, 1.7], "yaw_rad": 0.10},
-        {"label": "car_left", "center_ego": [14.0, 4.2, 0.85], "size_lwh": [4.6, 1.9, 1.7], "yaw_rad": -0.08},
-        {"label": "car_right", "center_ego": [16.0, -4.0, 0.85], "size_lwh": [4.6, 1.9, 1.7], "yaw_rad": 0.05},
-    ]
+boxes = [
+    {'label': 'lead_car', 'center_ego': [18.0, 0.8, 0.85], 'size_lwh': [4.6, 1.9, 1.7], 'yaw_rad': 0.18},
+    {'label': 'car_left', 'center_ego': [11.5, 4.4, 0.85], 'size_lwh': [4.4, 1.9, 1.7], 'yaw_rad': 0.26},
+    {'label': 'car_right', 'center_ego': [14.5, -4.2, 0.85], 'size_lwh': [4.5, 1.9, 1.7], 'yaw_rad': -0.10},
+]
 
-    map_polys = [
-        [[-28.0, -1.8, 0.0], [-10.0, -1.8, 0.0], [8.0, -1.8, 0.0], [26.0, -1.8, 0.0], [45.0, -1.8, 0.0]],
-        [[-28.0, 1.8, 0.0], [-10.0, 1.8, 0.0], [8.0, 1.8, 0.0], [26.0, 1.8, 0.0], [45.0, 1.8, 0.0]],
-    ]
+map_polys = [lane_poly(-3.5), lane_poly(0.0), lane_poly(3.5)]
 
-    lidar_points_ego = np.concatenate(
-        [
-            generate_box_points(boxes[0]["center_ego"], boxes[0]["size_lwh"], boxes[0]["yaw_rad"], n_per_face=300, seed=7),
-            generate_box_points(boxes[1]["center_ego"], boxes[1]["size_lwh"], boxes[1]["yaw_rad"], n_per_face=220, seed=8),
-            generate_box_points(boxes[2]["center_ego"], boxes[2]["size_lwh"], boxes[2]["yaw_rad"], n_per_face=220, seed=9),
-            generate_lane_points([-1.8, 1.8], x_min=-25.0, x_max=42.0, z=0.0, samples=260),
-        ],
-        axis=0,
-    )
+lidar_points_ego = np.concatenate([
+    *(generate_box_points(b['center_ego'], b['size_lwh'], b['yaw_rad'], n_per_face=420, seed=11 + i) for i, b in enumerate(boxes)),
+    *(lane_lidar_samples(poly, seed=40 + i) for i, poly in enumerate(map_polys)),
+], axis=0)
 
-    lidar_t = np.array([0.0, 0.0, 1.8], dtype=np.float64)
-    lidar_points_sensor = lidar_points_ego - lidar_t[None, :]
-    np.save(ROOT / "synthetic_lidar.npy", lidar_points_sensor.astype(np.float32))
+lidar_t = np.array([0.0, 0.0, 1.8], dtype=np.float64)
+lidar_points_sensor = lidar_points_ego - lidar_t[None, :]
+np.save(ROOT / 'synthetic_lidar.npy', lidar_points_sensor.astype(np.float32))
 
-    manifest = {
-        "tag": "synthetic_rig_scene",
-        "ego_pose": {"translation": [0.0, 0.0, 0.0], "yaw_rad": 0.0},
-        "cameras": camera_defs,
-        "lidar": {"points_path": "./synthetic_lidar.npy", "extrinsic_to_ego": {"translation": lidar_t.tolist(), "rotation_matrix": np.eye(3).tolist()}},
-        "bboxes": boxes,
-        "map": {"polylines_ego": map_polys},
-    }
+history_world = history_poses_world()
+history_traj = history_trajectory_ego()
 
-    with open(ROOT / "synthetic_manifest.json", "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
+manifest = {
+    'tag': 'synthetic_rig_scene',
+    'ego_pose': {'translation': [0.0, 0.0, 0.0], 'yaw_rad': 0.0},
+    'cameras': camera_defs,
+    'lidar': {
+        'points_path': './synthetic_lidar.npy',
+        'extrinsic_to_ego': {'translation': lidar_t.tolist(), 'rotation_matrix': np.eye(3).tolist()},
+    },
+    'bboxes': boxes,
+    'map': {'polylines_ego': [p.tolist() for p in map_polys]},
+    'history': {
+        'poses_world': [{'translation': T[:3, 3].tolist(), 'rotation_matrix': T[:3, :3].tolist()} for T in history_world],
+        'trajectory_ego': history_traj.tolist(),
+    },
+}
 
-    scene = bev.parse_scene(str(ROOT / "synthetic_manifest.json"))
-    for cam in scene.cameras:
-        render_camera_image(scene, cam, boxes, [np.asarray(p, dtype=np.float64) for p in map_polys], ROOT / f"{cam.name}.png")
+with open(ROOT / 'synthetic_manifest.json', 'w', encoding='utf-8') as f:
+    json.dump(manifest, f, indent=2)
 
-    scene = bev.parse_scene(str(ROOT / "synthetic_manifest.json"))
-    bev.visualize_scene(scene, str(ROOT / "synthetic_debug.png"), bev_range=35.0, frustum_far=28.0, show_lidar=True, show_boxes=True, show_map=True)
+scene = bev.parse_scene(str(ROOT / 'synthetic_manifest.json'))
+for cam in scene.cameras:
+    render_camera_image(scene, cam, ROOT / f'{cam.name}.png')
 
-    mirrored_dir = ROOT / "mirrored_images"
-    mirrored_scene = scene.mirrored(image_dir=str(mirrored_dir))
-    bev.visualize_scene(mirrored_scene, str(ROOT / "synthetic_debug_mirror.png"), bev_range=35.0, frustum_far=28.0, show_lidar=True, show_boxes=True, show_map=True)
+scene = bev.parse_scene(str(ROOT / 'synthetic_manifest.json'))
+scene.visualize(str(ROOT / 'synthetic_debug.png'), bev_range=40.0, frustum_far=28.0)
+scene_m = scene.mirrored()
+with open(ROOT / 'synthetic_manifest_mirror.json', 'w', encoding='utf-8') as f:
+    json.dump(scene_m.to_manifest_dict(), f, indent=2)
+scene_m.visualize(str(ROOT / 'synthetic_debug_mirror.png'), bev_range=40.0, frustum_far=28.0)
 
-    mirror_manifest = {
-        "tag": "synthetic_rig_scene_mirror",
-        "ego_pose": manifest["ego_pose"],
-        "cameras": [
-            {
-                "name": c.name,
-                "image_path": str(Path("mirrored_images") / Path(c.image_path).name),
-                "intrinsic": c.intrinsic.tolist(),
-                "extrinsic_to_ego": {"translation": c.T_cam_to_ego[:3, 3].tolist(), "rotation_matrix": c.T_cam_to_ego[:3, :3].tolist()},
-            }
-            for c in mirrored_scene.cameras
-        ],
-        "lidar": {"points_path": "./synthetic_lidar_mirror.npy", "extrinsic_to_ego": {"translation": [0.0, 0.0, 0.0], "rotation_matrix": np.eye(3).tolist()}},
-        "bboxes": [
-            {"label": b.label, "center_ego": b.center_ego.tolist(), "size_lwh": b.size_lwh.tolist(), "yaw_rad": b.yaw_rad}
-            for b in mirrored_scene.boxes
-        ],
-        "map": {"polylines_ego": [p.tolist() for p in mirrored_scene.map_record.polylines_ego]},
-    }
-    if mirrored_scene.lidar is not None:
-        np.save(ROOT / "synthetic_lidar_mirror.npy", mirrored_scene.lidar.points_xyz.astype(np.float32))
-    with open(ROOT / "synthetic_manifest_mirror.json", "w", encoding="utf-8") as f:
-        json.dump(mirror_manifest, f, indent=2)
-
-    print(f"Wrote synthetic scene bundle to {ROOT}")
-
-
-if __name__ == "__main__":
-    main()
+print('Wrote synthetic scene to', ROOT)
